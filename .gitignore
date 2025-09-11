@@ -1,50 +1,5 @@
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.pdb
-*.egg-info/
-*.egg
-*.manifest
-*.spec
-
-# Virtual Environments
 venv/
-ENV/
-env/
-.venv/
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints
-
-# VSCode settings
-.vscode/
-*.code-workspace
-
-# OS specific
-.DS_Store
-Thumbs.db
-
-# Logs & cache
-*.log
-*.sqlite3
-*.db
-*.cache
-*.pot
+__pycache__/
 *.pyc
-*.pkl
-
-# Dash assets cache
-.cache/
-*.map
-
-# Environment variables
 .env
-*.env
-
-# Build / dist (if packaging)
-build/
-dist/
-*.egg-info/
+.DS_Store
