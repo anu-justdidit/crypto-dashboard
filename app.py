@@ -1,411 +1,435 @@
-
-# app.py — Crypto Dashboard (bulletproof, Dash-only, no html.Style)
+"""
+app.py — Multi-coin Full-Mode Crypto Dashboard (Dash)
+Features:
+- Multi-select up to 5 coins
+- Full mode: 5 charts per coin (Price+BB, Moving Averages, Volume, RSI, MACD)
+- CoinGecko primary, Yahoo Finance fallback
+- Lightweight TTL cache + HTTP retries
+- Single callback generates per-coin chart sets (easy to maintain)
+- Responsive CSS grid layout
+"""
 import os
 import time
+import logging
+from typing import Dict, Optional
+
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 import dash
-from dash import html, dcc, Input, Output
+from dash import html, dcc, Input, Output, State
 import plotly.graph_objects as go
 
-# ======================
+# ---------------------------
 # CONFIG
-# ======================
-COINS = [
-    {"label": "Bitcoin (BTC)", "value": "bitcoin"},
-    {"label": "Ethereum (ETH)", "value": "ethereum"},
-    {"label": "Solana (SOL)", "value": "solana"},
-    {"label": "Cardano (ADA)", "value": "cardano"},
-    {"label": "Polkadot (DOT)", "value": "polkadot"},
-]
+# ---------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("crypto_dashboard")
 
-YF_SYMBOLS = {
-    "bitcoin": "BTC-USD",
-    "ethereum": "ETH-USD",
-    "solana": "SOL-USD",
-    "cardano": "ADA-USD",
-    "polkadot": "DOT-USD",
+SESSION = requests.Session()
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+retry = Retry(total=3, backoff_factor=0.4, status_forcelist=[429,502,503,504], allowed_methods=["GET"])
+SESSION.mount("https://", HTTPAdapter(max_retries=retry))
+SESSION.mount("http://", HTTPAdapter(max_retries=retry))
+
+# Supported coins (CoinGecko id, Yahoo ticker)
+COIN_META = {
+    "bitcoin":     {"label":"Bitcoin (BTC)",     "cg":"bitcoin",      "yf":"BTC-USD"},
+    "ethereum":    {"label":"Ethereum (ETH)",    "cg":"ethereum",     "yf":"ETH-USD"},
+    "solana":      {"label":"Solana (SOL)",      "cg":"solana",       "yf":"SOL-USD"},
+    "cardano":     {"label":"Cardano (ADA)",     "cg":"cardano",      "yf":"ADA-USD"},
+    "polkadot":    {"label":"Polkadot (DOT)",    "cg":"polkadot",     "yf":"DOT-USD"},
 }
 
-DEFAULT_COIN = "bitcoin"
-REFRESH_INTERVAL = 120 * 1000  # 2 minutes
-CACHE_DURATION = 300           # 5 minutes
-MIN_ROWS_REQUIRED = 20         # validation threshold
+DEFAULT_SELECTION = ["bitcoin", "ethereum", "solana"]
+MAX_COINS = 5
 
-# ======================
-# SMALL UTILS / CACHES
-# ======================
-def _now_ts() -> int:
-    return int(time.time())
+REFRESH_INTERVAL_MS = 120 * 1000   # dashboard refresh
+CACHE_TTL = 300                    # seconds
+MIN_ROWS_REQUIRED = 5              # adjust for less-liquid coins
 
-# simple TTL cache for CoinGecko
-_cg_cache = {}
-def _cg_key(coin_id: str, vs: str, days: int) -> str:
-    return f"{coin_id}|{vs}|{days}"
+# Simple in-memory cache
+_CACHE: Dict[str, Dict] = {}
 
-def cg_market_chart(coin_id: str, vs_currency: str, days: int):
-    """TTL cached CoinGecko market_chart."""
-    key = _cg_key(coin_id, vs_currency, int(days))
-    entry = _cg_cache.get(key)
-    if entry and _now_ts() - entry["ts"] < CACHE_DURATION:
-        return entry["data"]
+def cache_get(key: str) -> Optional[dict]:
+    ent = _CACHE.get(key)
+    if not ent: 
+        return None
+    if time.time() - ent["ts"] > CACHE_TTL:
+        _CACHE.pop(key, None)
+        return None
+    return ent["data"]
+
+def cache_set(key: str, data: dict):
+    _CACHE[key] = {"ts": time.time(), "data": data}
+
+# ---------------------------
+# DATA FETCH & PROCESS
+# ---------------------------
+def cg_market_chart(coin_id: str, days: int) -> Optional[dict]:
+    key = f"cg|{coin_id}|{days}"
+    cached = cache_get(key)
+    if cached:
+        return cached
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": vs_currency, "days": int(days)}
+    params = {"vs_currency":"usd", "days": days}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = SESSION.get(url, params=params, timeout=12)
         r.raise_for_status()
-        data = r.json()
-        _cg_cache[key] = {"ts": _now_ts(), "data": data}
-        return data
+        j = r.json()
+        # basic validation
+        if not isinstance(j, dict) or "prices" not in j:
+            logger.warning("CoinGecko returned unexpected payload for %s", coin_id)
+            return None
+        cache_set(key, j)
+        return j
     except Exception as e:
-        print(f"[CG ERROR] {e}")
+        logger.warning("CoinGecko error %s: %s", coin_id, e)
         return None
 
-def get_yf(symbol: str, period: str) -> pd.DataFrame:
-    """yfinance with CSV cache (no parse_dates issues)."""
-    os.makedirs("data/raw", exist_ok=True)
-    cache_file = f"data/raw/yfinance_{symbol}.csv"
-
-    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file) < CACHE_DURATION):
-        try:
-            return pd.read_csv(cache_file, index_col="Date", parse_dates=True)
-        except Exception as e:
-            print(f"[CACHE READ WARN] {e}")
-
+def fetch_yf_df(ticker: str, period: str = "3mo") -> pd.DataFrame:
+    key = f"yf|{ticker}|{period}"
+    cached = cache_get(key)
+    if cached:
+        return pd.DataFrame.from_dict(cached)
     try:
-        df = yf.download(symbol, period=period, progress=False, auto_adjust=False)
-        if not df.empty:
-            df.to_csv(cache_file, index_label="Date")
-        return df
-    except Exception as e:
-        print(f"[YF ERROR] {e}")
-        return pd.DataFrame()
-
-# ======================
-# DATA PIPELINE
-# ======================
-def validate_df(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-    if "Close" not in df.columns:
-        return False
-    return df["Close"].dropna().shape[0] >= MIN_ROWS_REQUIRED
-
-def fetch_from_cg(coin_id: str, days: int) -> pd.DataFrame:
-    """Fetch & align CoinGecko data; daily resample for stability."""
-    data = cg_market_chart(coin_id, "usd", int(days))
-    if not data:
-        return pd.DataFrame()
-    try:
-        # Raw lists
-        prices_raw = data.get("prices", [])
-        vols_raw = data.get("total_volumes", [])
-
-        # Build DFs
-        prices = pd.DataFrame(prices_raw, columns=["timestamp", "price"])
-        volumes = pd.DataFrame(vols_raw, columns=["timestamp", "volume"])
-
-        # Align by timestamp (handles mismatched lengths)
-        df = pd.merge(prices, volumes, on="timestamp", how="inner")
-
-        # If still mismatched somehow, trim to shortest safely
-        min_len = min(len(prices), len(volumes))
-        if len(df) == 0 and min_len > 0:
-            prices = prices.iloc[:min_len].copy()
-            volumes = volumes.iloc[:min_len].copy()
-            df = pd.merge(prices, volumes, on="timestamp", how="inner")
-
-        if df.empty:
+        df = yf.download(ticker, period=period, progress=False, threads=False, auto_adjust=False)
+        if df is None or df.empty:
             return pd.DataFrame()
-
-        df["date"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.set_index("date").sort_index()
-
-        # Resample daily → last price, sum volume
-        df = df.resample("1D").agg({"price": "last", "volume": "sum"})
-        df.rename(columns={"price": "Close", "volume": "Volume"}, inplace=True)
+        # ensure Close & Volume present
+        for col in ["Close", "Volume"]:
+            if col not in df.columns:
+                df[col] = np.nan
+        df.index = pd.to_datetime(df.index)
+        cache_set(key, df[["Close","Volume"]].to_dict(orient="list"))
         return df
     except Exception as e:
-        print(f"[CG PARSE ERROR] {e}")
+        logger.warning("yfinance error %s: %s", ticker, e)
         return pd.DataFrame()
 
-def fetch_from_yf(coin_id: str, days: int) -> pd.DataFrame:
-    symbol = YF_SYMBOLS.get(coin_id, "BTC-USD")
-    period = {30: "1mo", 90: "3mo", 365: "1y"}.get(int(days), "1mo")
-    df = get_yf(symbol, period)
-    if df is None or df.empty:
+def process_cg_to_df(coin_cg_id: str, days: int) -> pd.DataFrame:
+    j = cg_market_chart(coin_cg_id, days)
+    if not j:
+        return pd.DataFrame()
+    try:
+        prices = pd.DataFrame(j.get("prices", []), columns=["ts","price"])
+        vols = pd.DataFrame(j.get("total_volumes", []), columns=["ts","volume"])
+        # convert ms -> datetime
+        prices["date"] = pd.to_datetime(prices["ts"], unit="ms")
+        vols["date"] = pd.to_datetime(vols["ts"], unit="ms")
+        # merge on date (nearest)
+        df = pd.merge_asof(prices.sort_values("date"), vols.sort_values("date"), on="date")
+        df = df.set_index("date").sort_index()
+        df = df[["price","volume"]].rename(columns={"price":"Close","volume":"Volume"})
+        # resample daily (fill gaps)
+        df = df.resample("D").last().ffill()
+        return df
+    except Exception as e:
+        logger.warning("parse cg payload fail %s: %s", coin_cg_id, e)
         return pd.DataFrame()
 
-    # Ensure datetime index
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            pass
+def load_coin_df(coin_key: str, days: int = 90) -> pd.DataFrame:
+    """Try CoinGecko first, if inadequate fallback to Yahoo Finance"""
+    meta = COIN_META.get(coin_key)
+    if not meta:
+        return pd.DataFrame()
+    # Try CoinGecko
+    df = process_cg_to_df(meta["cg"], days)
+    if _is_valid_df(df):
+        return df
+    # Fallback: Yahoo
+    yf_period = {7:"7d", 30:"1mo", 90:"3mo", 365:"1y"}.get(days, "3mo")
+    df_yf = fetch_yf_df(meta["yf"], period=yf_period)
+    if df_yf is None or df_yf.empty:
+        return pd.DataFrame()
+    # normalize to Close/Volume with daily resample / forward fill
+    df2 = df_yf[["Close","Volume"]].copy()
+    df2 = df2.resample("D").last().ffill()
+    if _is_valid_df(df2):
+        return df2
+    return pd.DataFrame()
 
-    # Keep only needed columns; create Volume if missing
-    cols = df.columns
-    out = pd.DataFrame(index=df.index)
-    out["Close"] = df["Close"] if "Close" in cols else np.nan
-    out["Volume"] = df["Volume"] if "Volume" in cols else np.nan
-    return out
+def _is_valid_df(df: pd.DataFrame) -> bool:
+    if df is None or df.empty or "Close" not in df.columns:
+        return False
+    valid = df["Close"].dropna()
+    return len(valid) >= MIN_ROWS_REQUIRED and valid.max() > 0
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------
+# INDICATORS
+# ---------------------------
+def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "Close" not in df.columns:
-        return df.copy()
-
+        return df
     out = df.copy()
-
-    # RSI (14) safe
+    out["SMA_20"] = out["Close"].rolling(20).mean()
+    out["SMA_50"] = out["Close"].rolling(50).mean()
+    out["EMA_12"] = out["Close"].ewm(span=12, adjust=False).mean()
+    out["EMA_26"] = out["Close"].ewm(span=26, adjust=False).mean()
+    out["MACD"] = out["EMA_12"] - out["EMA_26"]
+    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
+    # RSI
     delta = out["Close"].diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
-    avg_gain = gain.rolling(14, min_periods=14).mean()
-    avg_loss = loss.rolling(14, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
     out["RSI"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
-    out["MACD"] = ema12 - ema26
-    out["Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-
-    # MAs
-    out["SMA_50"] = out["Close"].rolling(50, min_periods=25).mean()
-    out["EMA_20"] = out["Close"].ewm(span=20, adjust=False).mean()
-
+    # Bollinger
+    out["BB_MID"] = out["Close"].rolling(20).mean()
+    bb_std = out["Close"].rolling(20).std()
+    out["BB_UP"] = out["BB_MID"] + 2 * bb_std
+    out["BB_LO"] = out["BB_MID"] - 2 * bb_std
+    # Volume SMA
+    out["VOL_SMA20"] = out["Volume"].rolling(20).mean()
     return out
 
-def compute_kpis(df: pd.DataFrame, coin_id: str, source_used: str):
-    closes = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
-    last_close = closes.iloc[-1] if not closes.empty else np.nan
-
-    if closes.shape[0] >= 2:
-        prev_close = closes.iloc[-2]
-        change_24h = ((last_close - prev_close) / prev_close) * 100
-    else:
-        change_24h = np.nan
-
-    # Volume safe
-    if "Volume" in df.columns and not df["Volume"].dropna().empty:
-        volume = df["Volume"].dropna().iloc[-1]
-    else:
-        volume = np.nan
-
-    # If source is CG, try live KPIs (guarded)
-    try:
-        if source_used == "coingecko":
-            url = "https://api.coingecko.com/api/v3/simple/price"
-            params = {"ids": coin_id, "vs_currencies": "usd", "include_24hr_change": "true"}
-            j = requests.get(url, params=params, timeout=10).json().get(coin_id, {})
-            if "usd" in j:
-                last_close = j["usd"]
-            if "usd_24h_change" in j and j["usd_24h_change"] is not None:
-                change_24h = j["usd_24h_change"]
-    except Exception as e:
-        print(f"[KPI WARN] {e}")
-
-    rsi_series = df["RSI"].dropna() if "RSI" in df.columns else pd.Series(dtype=float)
-    rsi_last = rsi_series.iloc[-1] if not rsi_series.empty else np.nan
-
-    def kpi_card(title, value, tooltip, color=None):
-        return html.Div(
-            [
-                html.Div(title, className="kpi-title", title=tooltip),
-                html.Div(value, className="kpi-value", style={"color": color} if color else None),
-            ],
-            className="kpi-card",
-        )
-
-    color_change = "var(--green)" if (isinstance(change_24h, (int, float)) and not np.isnan(change_24h) and change_24h >= 0) else "var(--red)"
-    rsi_color = None
-    if isinstance(rsi_last, (int, float)) and not np.isnan(rsi_last):
-        rsi_color = "var(--red)" if rsi_last > 70 else ("var(--green)" if rsi_last < 30 else None)
-
-    cards = [
-        kpi_card("Price", f"${last_close:,.2f}" if pd.notna(last_close) else "N/A", "Current price"),
-        kpi_card("24h Change", f"{change_24h:+.2f}%" if pd.notna(change_24h) else "N/A", "24-hour change", color_change if pd.notna(change_24h) else None),
-        kpi_card("Volume", f"${volume:,.0f}" if pd.notna(volume) else "N/A", "Latest period volume"),
-        kpi_card("RSI", f"{rsi_last:.1f}" if pd.notna(rsi_last) else "N/A", "Relative Strength Index", rsi_color),
-        html.Div(
-            [html.Span("Data Source:", className="kpi-title"), html.Span(source_used.upper(), className="kpi-value")],
-            className="kpi-card",
-        ),
-    ]
-    return cards
-
-# ======================
+# ---------------------------
 # DASH APP
-# ======================
-app = dash.Dash(__name__, title="Crypto Analytics Pro")
+# ---------------------------
+app = dash.Dash(__name__, title="Multi-Coin Crypto Dashboard (Full Mode)")
 server = app.server
 
-app.layout = html.Div(
-    [
-        html.Div(
-            [html.H1("📊 Crypto Analytics Dashboard", className="header-title"),
-             html.P("Live market tracking with automatic data-source fallback", className="header-subtitle")],
-            className="header",
-        ),
-        html.Div(
-            [
-                dcc.Dropdown(id="coin-selector", options=COINS, value=DEFAULT_COIN, clearable=False, className="dropdown"),
-                dcc.RadioItems(
-                    id="data-source",
-                    options=[
-                        {"label": " CoinGecko", "value": "coingecko"},
-                        {"label": " Yahoo Finance", "value": "yfinance"},
-                        {"label": " Auto (fallback)", "value": "auto"},
-                    ],
-                    value="auto",
-                    inline=True,
-                    className="radio-items",
-                ),
-                dcc.Dropdown(
-                    id="timeframe",
-                    options=[
-                        {"label": "1 Month", "value": "30"},
-                        {"label": "3 Months", "value": "90"},
-                        {"label": "1 Year", "value": "365"},
-                    ],
-                    value="90",
-                    clearable=False,
-                    className="dropdown",
-                ),
-                dcc.Checklist(
-                    id="indicators",
-                    options=[
-                        {"label": " RSI", "value": "RSI"},
-                        {"label": " MACD", "value": "MACD"},
-                        {"label": " Moving Averages", "value": "MA"},
-                    ],
-                    value=["RSI", "MACD"],
-                    inline=True,
-                    className="checklist",
-                ),
-            ],
-            className="controls",
-        ),
-        html.Div(id="kpi-cards", className="kpi-container"),
-        dcc.Graph(id="price-chart", className="chart"),
-        dcc.Graph(id="indicator-chart", className="chart"),
-        dcc.Store(id="data-store"),
-        dcc.Store(id="source-used"),
-        dcc.Interval(id="refresh-interval", interval=REFRESH_INTERVAL),
-    ],
-    className="page",
-)
+# Inline CSS for clean responsive grid
+app.index_string = """
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            body{font-family:Inter,Segoe UI,Roboto,Arial; margin:0; padding:18px; background:#0f172a; color:#e6eef8;}
+            .header{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px}
+            .title{font-size:22px; font-weight:600}
+            .subtitle{font-size:12px; color:#cbd5e1}
+            .controls{background:#ffffff0f; padding:14px; border-radius:10px; margin-bottom:16px}
+            .grid{display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap:16px}
+            .card{background:linear-gradient(180deg,#07133066,#0b1b3b88); padding:12px; border-radius:10px; box-shadow:0 6px 20px rgba(2,6,23,0.6)}
+            .coin-title{font-weight:600; color:#f8fafc; margin-bottom:6px}
+            .kpis{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px}
+            .kpi{background:#ffffff10; padding:8px 10px; border-radius:8px; min-width:106px; text-align:center}
+            .kpi .val{font-weight:700}
+            footer{color:#94a3b8; margin-top:18px; font-size:12px}
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>{%config%}{%scripts%}{%renderer%}</footer>
+    </body>
+</html>
+"""
 
-# ======================
-# CALLBACKS
-# ======================
+controls_children = html.Div([
+    html.Div([
+        html.Div([html.Div("📊 Multi-Coin Full Mode", className="title"), html.Div("Pick up to 5 coins — full indicator set", className="subtitle")]),
+    ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","gap":"12px","marginBottom":"8px"}),
+    html.Div([
+        dcc.Dropdown(
+            id="multi-coins",
+            options=[{"label": COIN_META[k]["label"], "value": k} for k in COIN_META],
+            value=DEFAULT_SELECTION,
+            multi=True,
+            placeholder="Select coins (max 5)"
+        ),
+        html.Div(style={"height":"8px"}),
+        dcc.Dropdown(
+            id="timeframe",
+            options=[{"label":"7 Days","value":"7"},{"label":"30 Days","value":"30"},{"label":"90 Days","value":"90"},{"label":"1 Year","value":"365"}],
+            value="90",
+            clearable=False
+        ),
+        html.Div(style={"height":"8px"}),
+        dcc.RadioItems(id="data-source", value="auto", options=[
+            {"label":" Auto (CoinGecko -> Yahoo)", "value":"auto"},
+            {"label":" CoinGecko only", "value":"coingecko"},
+            {"label":" Yahoo only", "value":"yfinance"},
+        ], inline=True),
+    ], style={"display":"grid","gridTemplateColumns":"1fr","gap":"8px"})
+], className="controls")
+
+app.layout = html.Div([
+    html.Div([controls_children], className="controls"),
+    html.Div(id="coins-container"),
+    dcc.Interval(id="refresh", interval=REFRESH_INTERVAL_MS, n_intervals=0),
+    html.Div(id="debug", style={"display":"none"})
+])
+
+# ---------------------------
+# Helper to build per-coin card (returns html.Div)
+# ---------------------------
+def make_coin_card(coin_key: str, df: pd.DataFrame, used_source: str) -> html.Div:
+    meta = COIN_META[coin_key]
+    title = meta["label"]
+    # KPI values (guarded)
+    price = df["Close"].dropna().iloc[-1] if "Close" in df.columns and not df["Close"].dropna().empty else None
+    prev = df["Close"].dropna().iloc[-2] if "Close" in df.columns and df["Close"].dropna().shape[0] >= 2 else price
+    change = ((price - prev) / prev * 100) if (price is not None and prev not in (None, 0)) else 0
+    vol = df["Volume"].dropna().iloc[-1] if "Volume" in df.columns and not df["Volume"].dropna().empty else None
+    rsi = df["RSI"].dropna().iloc[-1] if "RSI" in df.columns and not df["RSI"].dropna().empty else None
+
+    # Price + BB figure
+    fig_price = go.Figure()
+    fig_price.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(width=2)))
+    if "BB_UP" in df.columns:
+        fig_price.add_trace(go.Scatter(x=df.index, y=df["BB_UP"], name="BB UP", line=dict(dash="dot"), opacity=0.6))
+        fig_price.add_trace(go.Scatter(x=df.index, y=df["BB_LO"], name="BB LO", line=dict(dash="dot"), opacity=0.6, fill='tonexty'))
+    fig_price.update_layout(margin=dict(l=20,r=20,t=30,b=20), height=260, template="plotly_dark", title="Price + Bollinger")
+
+    # Moving averages panel
+    fig_ma = go.Figure()
+    if "SMA_20" in df.columns:
+        fig_ma.add_trace(go.Scatter(x=df.index, y=df["SMA_20"], name="SMA 20"))
+    if "SMA_50" in df.columns:
+        fig_ma.add_trace(go.Scatter(x=df.index, y=df["SMA_50"], name="SMA 50"))
+    if "EMA_12" in df.columns:
+        fig_ma.add_trace(go.Scatter(x=df.index, y=df["EMA_12"], name="EMA 12"))
+    fig_ma.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(width=1), opacity=0.6))
+    fig_ma.update_layout(margin=dict(l=20,r=20,t=30,b=20), height=200, template="plotly_dark", title="Moving Averages")
+
+    # Volume chart
+    fig_vol = go.Figure()
+    if "Volume" in df.columns:
+        fig_vol.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"))
+    if "VOL_SMA20" in df.columns:
+        fig_vol.add_trace(go.Scatter(x=df.index, y=df["VOL_SMA20"], name="Vol SMA20", line=dict(color="yellow")))
+    fig_vol.update_layout(margin=dict(l=20,r=20,t=30,b=20), height=160, template="plotly_dark", title="Volume")
+
+    # RSI chart
+    fig_rsi = go.Figure()
+    if "RSI" in df.columns:
+        fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI"))
+        fig_rsi.add_hline(y=70, line_dash="dot", line_color="red")
+        fig_rsi.add_hline(y=30, line_dash="dot", line_color="green")
+    fig_rsi.update_layout(margin=dict(l=20,r=20,t=30,b=20), height=140, template="plotly_dark", title="RSI (14)")
+
+    # MACD chart
+    fig_macd = go.Figure()
+    if "MACD" in df.columns and "MACD_Signal" in df.columns:
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD"))
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df["MACD_Signal"], name="Signal"))
+        fig_macd.add_trace(go.Bar(x=df.index, y=df.get("MACD_Hist", []), name="Hist", opacity=0.3))
+    fig_macd.update_layout(margin=dict(l=20,r=20,t=30,b=20), height=140, template="plotly_dark", title="MACD")
+
+    # KPI cards
+    kpis = html.Div([
+        html.Div([
+            html.Div(f"${price:,.2f}" if price is not None else "N/A", className="val"),
+            html.Div("Price")
+        ], className="kpi"),
+        html.Div([
+            html.Div(f"{change:+.2f}%" if change is not None else "N/A", className="val"),
+            html.Div("Change")
+        ], className="kpi"),
+        html.Div([
+            html.Div(f"${vol:,.0f}" if vol is not None else "N/A", className="val"),
+            html.Div("Volume")
+        ], className="kpi"),
+        html.Div([
+            html.Div(f"{rsi:.1f}" if rsi is not None else "N/A", className="val"),
+            html.Div("RSI")
+        ], className="kpi"),
+        html.Div([
+            html.Div(used_source.upper() if used_source else "N/A", className="val"),
+            html.Div("Source")
+        ], className="kpi"),
+    ], className="kpis")
+
+    return html.Div([
+        html.Div([html.Div(title, className="coin-title"), kpis]),
+        html.Div(className="card", children=[
+            dcc.Graph(figure=fig_price, config={"displayModeBar": False}),
+            dcc.Graph(figure=fig_ma, config={"displayModeBar": False}),
+            dcc.Graph(figure=fig_vol, config={"displayModeBar": False}),
+            dcc.Graph(figure=fig_rsi, config={"displayModeBar": False}),
+            dcc.Graph(figure=fig_macd, config={"displayModeBar": False}),
+        ])
+    ], style={"marginBottom":"12px"})
+
+# ---------------------------
+# MAIN CALLBACK — builds grid of coin cards
+# ---------------------------
 @app.callback(
-    Output("data-store", "data"),
-    Output("kpi-cards", "children"),
-    Output("source-used", "data"),
-    Input("coin-selector", "value"),
-    Input("data-source", "value"),
+    Output("coins-container", "children"),
+    Input("multi-coins", "value"),
     Input("timeframe", "value"),
-    Input("refresh-interval", "n_intervals"),
+    Input("data-source", "value"),
+    Input("refresh", "n_intervals")
 )
-def update_data(coin_id, data_source, days, _):
-    try:
-        days = int(days) if days is not None else 90
+def render_selected_coins(selected, tf_value, data_source, n_intervals):
+    # ensure list
+    if not selected:
+        selected = DEFAULT_SELECTION
+    if isinstance(selected, str):
+        selected = [selected]
+    # enforce max
+    selected = selected[:MAX_COINS]
+    days = int(tf_value) if tf_value else 90
 
-        # Decide fetch order
-        if data_source == "auto":
-            order = ["coingecko", "yfinance"]
-        elif data_source == "coingecko":
-            order = ["coingecko", "yfinance"]
-        else:
-            order = ["yfinance", "coingecko"]
-
+    cards = []
+    debug_items = []
+    for coin_key in selected:
+        if coin_key not in COIN_META:
+            continue
+        df = None
         used = None
-        df = pd.DataFrame()
+        # choose data source behavior
+        order = []
+        if data_source == "auto":
+            order = ["coingecko","yfinance"]
+        else:
+            order = [data_source]
 
         for src in order:
             if src == "coingecko":
-                df = fetch_from_cg(coin_id, days)
-            else:
-                df = fetch_from_yf(coin_id, days)
+                df = process_cg_to_df(COIN_META[coin_key]["cg"], days)
+                if _is_valid_df(df):
+                    used = "coingecko"
+                    break
+            elif src == "yfinance":
+                # map days to yfinance period
+                yf_period = {7:"7d", 30:"1mo", 90:"3mo", 365:"1y"}.get(days, "3mo")
+                df_tmp = fetch_yf_df(COIN_META[coin_key]["yf"], period=yf_period)
+                if df_tmp is not None and not df_tmp.empty:
+                    df = df_tmp[["Close","Volume"]].copy()
+                    df = df.resample("D").last().ffill()
+                    if _is_valid_df(df):
+                        used = "yfinance"
+                        break
+                df = pd.DataFrame()  # ensure consistent type
 
-            if validate_df(df):
-                used = src
-                break
+        if df is None or df.empty or not _is_valid_df(df):
+            # show small card with error message instead of charts
+            err_card = html.Div([
+                html.Div(COIN_META[coin_key]["label"], className="coin-title"),
+                html.Div("⚠️ Data unavailable for this coin; try toggling data source or timeframe.", style={"color":"#ffb4a2","fontSize":"13px"})
+            ], className="card")
+            cards.append(err_card)
+            debug_items.append({coin_key: "no-data"})
+            continue
 
-        if used is None:
-            raise ValueError("No usable data from either source after validation.")
+        # enrich with indicators
+        df_ind = add_all_indicators(df)
+        card = make_coin_card(coin_key, df_ind, used)
+        cards.append(card)
+        debug_items.append({coin_key: f"rows={len(df_ind)}, src={used}"})
 
-        df = add_indicators(df)
+    # assemble grid
+    grid = html.Div(children=cards, className="grid")
+    # attach hidden debug for quick troubleshooting
+    logger.debug("render debug: %s", debug_items)
+    return html.Div([grid, html.Div(str(debug_items), id="debug", style={"display":"none"})])
 
-        kpis = compute_kpis(df, coin_id, used)
-        return df.to_json(date_format="iso"), kpis, used
-
-    except Exception as e:
-        print(f"[update_data ERROR] {e}")
-        def error_card(title, value, tooltip, color="var(--red)"):
-            return html.Div(
-                [html.Div(title, className="kpi-title", title=tooltip),
-                 html.Div(value, className="kpi-value", style={"color": color})],
-                className="kpi-card",
-            )
-        return None, [error_card("Error", str(e)[:160], "Data fetch failed")], None
-
-@app.callback(
-    Output("price-chart", "figure"),
-    Output("indicator-chart", "figure"),
-    Input("data-store", "data"),
-    Input("indicators", "value"),
-)
-def update_charts(json_data, indicators):
-    if not json_data:
-        return go.Figure(), go.Figure()
-    try:
-        df = pd.read_json(json_data)
-
-        # Ensure datetime index
-        if "index" in df.columns:
-            df.index = pd.to_datetime(df["index"])
-        else:
-            df.index = pd.to_datetime(df.index)
-
-        # Price figure
-        price_fig = go.Figure()
-        price_fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Price", line=dict(color="#64b5f6")))
-        if "MA" in indicators:
-            if "SMA_50" in df.columns:
-                price_fig.add_trace(go.Scatter(x=df.index, y=df["SMA_50"], name="50D SMA", line=dict(dash="dot")))
-            if "EMA_20" in df.columns:
-                price_fig.add_trace(go.Scatter(x=df.index, y=df["EMA_20"], name="20D EMA", line=dict(dash="dash")))
-        price_fig.update_layout(title="Price", xaxis_title="Date", yaxis_title="USD", hovermode="x unified", template="plotly_white")
-
-        # Indicators figure
-        indicator_fig = go.Figure()
-        if "RSI" in indicators and "RSI" in df.columns:
-            indicator_fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ffb74d")))
-            indicator_fig.add_hline(y=70, line_dash="dot", line_color="red")
-            indicator_fig.add_hline(y=30, line_dash="dot", line_color="green")
-        if "MACD" in indicators and "MACD" in df.columns and "Signal" in df.columns:
-            indicator_fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", line=dict(color="#66bb6a")))
-            indicator_fig.add_trace(go.Scatter(x=df.index, y=df["Signal"], name="Signal", line=dict(color="#ab63fa")))
-            hist = (df["MACD"] - df["Signal"]).fillna(0)
-            indicator_fig.add_trace(go.Bar(x=df.index, y=hist, name="MACD Hist", opacity=0.25))
-        indicator_fig.update_layout(title="Technical Indicators", xaxis_title="Date", hovermode="x unified", template="plotly_white")
-
-        return price_fig, indicator_fig
-
-    except Exception as e:
-        print(f"[update_charts ERROR] {e}")
-        return go.Figure(), go.Figure()
-
-# ======================
-# RUN
-# ======================
+# ---------------------------
+# RUN APPLICATION (Render compatible)
+# ---------------------------
 if __name__ == "__main__":
-    os.makedirs("data/raw", exist_ok=True)
-    app.run(debug=True, port=8050)
-
+    port = int(os.environ.get("PORT", 8050))
+    logger.info("Starting app on port %s", port)
+    app.run_server(debug=False, host="0.0.0.0", port=port)
